@@ -188,6 +188,7 @@ app.get('/health', (req, res) => {
 app.get('/status', authMiddleware, (req, res) => {
   res.json({
     status: connectionStatus,
+    whatsapp: connectionStatus,
     phone: connectedPhone,
     messagesSent,
     lastError,
@@ -238,19 +239,22 @@ app.post('/connect', authMiddleware, async (req, res) => {
 app.post('/disconnect', authMiddleware, async (req, res) => {
   if (sock) {
     try {
-      await sock.logout();
+      // Apenas fechar a conexão, NÃO chamar logout()
+      // logout() marca o device como deslogado no servidor WA e causa rate limit
+      sock.ev.removeAllListeners();
+      sock.ws.close();
     } catch (e) {}
     sock = null;
   }
   connectionStatus = 'disconnected';
   connectedPhone = null;
   qrCode = null;
-  
+
   // Limpar sessão
   try {
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
   } catch (e) {}
-  
+
   res.json({ status: 'disconnected', message: 'Desconectado e sessão limpa.' });
 });
 
