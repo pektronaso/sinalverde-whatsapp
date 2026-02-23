@@ -2,16 +2,16 @@ name: Deploy WhatsApp Service
 
 on:
   push:
-    branches: [master]
+    branches:
+      - master
   workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
-      - name: Checkout código
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Criar tarball
@@ -26,7 +26,7 @@ jobs:
           source: whatsapp-deploy.tar
           target: /home/ec2-user/
 
-      - name: Build & Deploy no EC2
+      - name: Build e Deploy no EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -35,29 +35,18 @@ jobs:
           command_timeout: 5m
           script: |
             set -e
-            echo "=== Extraindo código ==="
             mkdir -p /home/ec2-user/whatsapp-build
             tar -xf /home/ec2-user/whatsapp-deploy.tar -C /home/ec2-user/whatsapp-build/
-
-            echo "=== Docker build ==="
             cd /home/ec2-user/whatsapp-build
             docker build -t sinalverde-whatsapp .
-
-            echo "=== Reiniciando container ==="
             bash /home/ec2-user/sinalverde-whatsapp-run.sh
-
-            echo "=== Aguardando startup (10s) ==="
             sleep 10
-
-            echo "=== Health check ==="
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/health || echo "000")
             if [ "$STATUS" = "200" ]; then
-              echo "✅ Deploy OK — health check retornou 200"
+              echo "Deploy OK"
             else
-              echo "❌ Health check falhou (HTTP $STATUS)"
+              echo "Health check falhou (HTTP $STATUS)"
               docker logs sinalverde-whatsapp --tail 30
               exit 1
             fi
-
-            echo "=== Limpando ==="
             rm -f /home/ec2-user/whatsapp-deploy.tar
