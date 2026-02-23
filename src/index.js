@@ -23,6 +23,8 @@ let connectionStatus = 'disconnected'; // disconnected | connecting | connected
 let connectedPhone = null;  // número conectado
 let messagesSent = 0;
 let lastError = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
 
 // ============================================
 // LOGGER
@@ -84,20 +86,58 @@ async function connectWhatsApp() {
         
         console.log(`[WA] Desconectado — código: ${statusCode}`);
 
-        if (statusCode === reason.loggedOut) {
-          console.log('[WA] Deslogado — limpando sessão. Precisa escanear QR novamente.');
-          // Limpar auth data
-          try {
-            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-          } catch (e) {}
-          lastError = 'Sessão encerrada. Escaneie o QR Code novamente.';
+        // 401 após connect sem sessão = WA rate limit temporário
+        const isRateLimited = statusCode === 401;
+        // loggedOut = device desvinculado pelo usuário no celular
+        const isLoggedOut = statusCode === reason.loggedOut;
+
+        if (isLoggedOut) {
+          console.log('[WA] Logout pelo usuário — limpando auth e aguardando novo /connect...');
+          try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
+          lastError = 'Deslogado pelo celular. Clique em Conectar para gerar novo QR Code.';
+          reconnectAttempts = 0;
+        } else if (statusCode === 405 || statusCode === 515) {
+          // Sessão inválida/expirada — limpa e tenta de novo automaticamente
+          reconnectAttempts++;
+          try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
+          if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+            const delayMs = Math.min(3000 * reconnectAttempts, 15000);
+            console.log(`[WA] Sessão inválida (${statusCode}) — limpando auth e reconectando em ${delayMs/1000}s (tentativa ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+            lastError = `Regenerando QR Code... (tentativa ${reconnectAttempts})`;
+            setTimeout(connectWhatsApp, delayMs);
+          } else {
+            console.log('[WA] Múltiplas falhas de sessão. Aguardando /connect manual.');
+            lastError = 'Falha ao gerar sessão. Aguarde 1 minuto e clique em Conectar.';
+            reconnectAttempts = 0;
+          }
+        } else if (isRateLimited) {
+          reconnectAttempts++;
+          if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+            const delayMs = Math.min(10000 * reconnectAttempts, 60000);
+            console.log(`[WA] Rate limited (401) — retry em ${delayMs/1000}s (tentativa ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+            lastError = `Aguardando... Nova tentativa em ${delayMs/1000}s`;
+            try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
+            setTimeout(connectWhatsApp, delayMs);
+          } else {
+            console.log('[WA] Rate limit persistente. Aguarde alguns minutos e tente /connect novamente.');
+            lastError = 'WhatsApp temporariamente indisponível. Aguarde 2-3 minutos e tente novamente.';
+            reconnectAttempts = 0;
+          }
         } else if (statusCode === reason.restartRequired) {
           console.log('[WA] Restart necessário, reconectando...');
+          reconnectAttempts = 0;
           setTimeout(connectWhatsApp, 2000);
         } else if (statusCode !== reason.connectionClosed) {
-          console.log('[WA] Reconectando em 5s...');
-          lastError = `Desconectado (código ${statusCode}). Reconectando...`;
-          setTimeout(connectWhatsApp, 5000);
+          reconnectAttempts++;
+          if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+            const delayMs = Math.min(5000 * reconnectAttempts, 30000);
+            console.log(`[WA] Reconectando em ${delayMs/1000}s... (tentativa ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+            lastError = `Desconectado (código ${statusCode}). Reconectando...`;
+            setTimeout(connectWhatsApp, delayMs);
+          } else {
+            console.log('[WA] Máximo de tentativas atingido. Aguardando /connect manual.');
+            lastError = 'Falha ao reconectar após múltiplas tentativas. Clique em Conectar.';
+          }
         }
       }
 
