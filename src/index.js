@@ -24,6 +24,7 @@ let connectedPhone = null;  // número conectado
 let messagesSent = 0;
 let lastError = null;
 let reconnectAttempts = 0;
+let wasEverConnected = false;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
 // ============================================
@@ -84,59 +85,43 @@ async function connectWhatsApp() {
         connectionStatus = 'disconnected';
         connectedPhone = null;
         
-        console.log(`[WA] Desconectado — código: ${statusCode}`);
+        console.log(`[WA] Desconectado — código: ${statusCode} | wasEverConnected: ${wasEverConnected}`);
 
-        // 401 após connect sem sessão = WA rate limit temporário
-        const isRateLimited = statusCode === 401;
-        // loggedOut = device desvinculado pelo usuário no celular
-        const isLoggedOut = statusCode === reason.loggedOut;
+        // DisconnectReason.loggedOut === 401
+        // 401 pode significar:
+        //   - Logout real (usuário removeu device no celular) — só se wasEverConnected
+        //   - Rate limit / rejeição do WA (sem sessão válida) — se nunca conectou
+        const is401 = statusCode === reason.loggedOut; // loggedOut === 401
 
-        if (isLoggedOut) {
+        if (is401 && wasEverConnected) {
+          // Logout REAL — o usuário desvinculou o device pelo celular
           console.log('[WA] Logout pelo usuário — limpando auth e aguardando novo /connect...');
           try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
           lastError = 'Deslogado pelo celular. Clique em Conectar para gerar novo QR Code.';
           reconnectAttempts = 0;
-        } else if (statusCode === 405 || statusCode === 515) {
-          // Sessão inválida/expirada — limpa e tenta de novo automaticamente
+          wasEverConnected = false;
+        } else if (statusCode === reason.restartRequired) {
+          // 515 — WA quer que a gente reconecte
+          console.log('[WA] Restart necessário, reconectando em 2s...');
+          reconnectAttempts = 0;
+          setTimeout(connectWhatsApp, 2000);
+        } else if (statusCode === reason.connectionClosed) {
+          // 428 — conexão fechada normalmente (ex: /disconnect)
+          console.log('[WA] Conexão fechada normalmente.');
+        } else {
+          // Qualquer outro erro (401 rate limit, 405, 408, 500, etc) — retry com backoff
           reconnectAttempts++;
           try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
           if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
-            const delayMs = Math.min(3000 * reconnectAttempts, 15000);
-            console.log(`[WA] Sessão inválida (${statusCode}) — limpando auth e reconectando em ${delayMs/1000}s (tentativa ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+            const delayMs = Math.min(5000 * reconnectAttempts, 30000);
+            console.log(`[WA] Erro ${statusCode} — limpando sessão e reconectando em ${delayMs/1000}s (tentativa ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
             lastError = `Regenerando QR Code... (tentativa ${reconnectAttempts})`;
             setTimeout(connectWhatsApp, delayMs);
           } else {
-            console.log('[WA] Múltiplas falhas de sessão. Aguardando /connect manual.');
-            lastError = 'Falha ao gerar sessão. Aguarde 1 minuto e clique em Conectar.';
-            reconnectAttempts = 0;
-          }
-        } else if (isRateLimited) {
-          reconnectAttempts++;
-          if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
-            const delayMs = Math.min(10000 * reconnectAttempts, 60000);
-            console.log(`[WA] Rate limited (401) — retry em ${delayMs/1000}s (tentativa ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-            lastError = `Aguardando... Nova tentativa em ${delayMs/1000}s`;
-            try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
-            setTimeout(connectWhatsApp, delayMs);
-          } else {
-            console.log('[WA] Rate limit persistente. Aguarde alguns minutos e tente /connect novamente.');
-            lastError = 'WhatsApp temporariamente indisponível. Aguarde 2-3 minutos e tente novamente.';
-            reconnectAttempts = 0;
-          }
-        } else if (statusCode === reason.restartRequired) {
-          console.log('[WA] Restart necessário, reconectando...');
-          reconnectAttempts = 0;
-          setTimeout(connectWhatsApp, 2000);
-        } else if (statusCode !== reason.connectionClosed) {
-          reconnectAttempts++;
-          if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
-            const delayMs = Math.min(5000 * reconnectAttempts, 30000);
-            console.log(`[WA] Reconectando em ${delayMs/1000}s... (tentativa ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-            lastError = `Desconectado (código ${statusCode}). Reconectando...`;
-            setTimeout(connectWhatsApp, delayMs);
-          } else {
             console.log('[WA] Máximo de tentativas atingido. Aguardando /connect manual.');
-            lastError = 'Falha ao reconectar após múltiplas tentativas. Clique em Conectar.';
+            lastError = 'Falha ao conectar. Aguarde 2-3 minutos e clique em Conectar.';
+            reconnectAttempts = 0;
+            wasEverConnected = false;
           }
         }
       }
@@ -146,6 +131,8 @@ async function connectWhatsApp() {
         qrCode = null;
         qrCodeRaw = null;
         lastError = null;
+        reconnectAttempts = 0;
+        wasEverConnected = true;
 
         // Extrair número conectado
         const me = sock.user;
@@ -263,13 +250,22 @@ app.post('/connect', authMiddleware, async (req, res) => {
     return res.json({ status: 'already_connected', phone: connectedPhone });
   }
   
-  // Limpar sessão se pedido
-  if (req.body?.reset) {
-    try {
-      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      console.log('[WA] Sessão limpa — novo QR será gerado');
-    } catch (e) {}
-  }
+  // Sempre limpar sessão para gerar QR fresco
+  try {
+    if (sock) {
+      sock.ev.removeAllListeners();
+      sock = null;
+    }
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    console.log('[WA] Sessão limpa — novo QR será gerado');
+  } catch (e) {}
+  
+  connectionStatus = 'disconnected';
+  reconnectAttempts = 0;
+  wasEverConnected = false;
+  qrCode = null;
+  qrCodeRaw = null;
+  lastError = null;
   
   connectWhatsApp();
   res.json({ status: 'connecting', message: 'Conectando... Acesse /qr para obter o QR Code.' });
